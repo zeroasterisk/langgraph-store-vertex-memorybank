@@ -2,19 +2,23 @@
 
 Demonstrates:
     - Multi-turn conversation with long-term memory
-    - Cross-session memory recall
+    - Cross-session memory recall (start new session, memories persist)
     - LLM-powered memory extraction from conversation turns
     - Per-user scoped memory isolation
+    - Pre-built recall and capture nodes
 
 Usage:
-    # Set your GCP project
+    # Set your GCP project (or use defaults)
     export GCP_PROJECT_ID=your-project
     export REASONING_ENGINE_ID=your-engine-id
+
+    # Install deps
+    pip install "langgraph-vertex-memorybank[sample]"
 
     # Run
     python sample/chatbot.py
 
-    # Or with custom user
+    # With custom user
     python sample/chatbot.py --user alice
 """
 
@@ -36,7 +40,11 @@ from langgraph.checkpoint.memory import MemorySaver
 from langgraph.graph import END, START, StateGraph
 from langgraph.graph.message import add_messages
 
-from langgraph_store_vertex_memorybank import VertexMemoryBankStore
+from langgraph_vertex_memorybank import (
+    VertexMemoryBankStore,
+    create_capture_node,
+    create_recall_node,
+)
 
 
 # ── State ───────────────────────────────────────────────────────────────
@@ -47,7 +55,6 @@ class ChatState(TypedDict):
 
     messages: Annotated[list[BaseMessage], add_messages]
     user_id: str
-    memories: str  # Retrieved memories as context
 
 
 # ── Configuration ───────────────────────────────────────────────────────
@@ -61,6 +68,8 @@ MODEL = os.environ.get("GEMINI_MODEL", "gemini-3.1-flash-preview")
 def create_chatbot(user_id: str = "demo-user"):
     """Create a LangGraph chatbot with Memory Bank integration.
 
+    Uses pre-built recall and capture nodes for clean graph wiring.
+
     Args:
         user_id: User identifier for memory scoping.
 
@@ -72,100 +81,38 @@ def create_chatbot(user_id: str = "demo-user"):
         project_id=PROJECT_ID,
         location=LOCATION,
         reasoning_engine_id=ENGINE_ID,
+        default_top_k=5,
+        min_similarity_score=0.3,
+        topics=["preferences", "facts", "instructions"],
     )
 
     # Initialize the LLM
-    llm = ChatGoogleGenerativeAI(
-        model=MODEL,
-        temperature=0.7,
+    llm = ChatGoogleGenerativeAI(model=MODEL, temperature=0.7)
+
+    # Pre-built nodes
+    recall = create_recall_node(store, recall_mode="system", top_k=5)
+    capture = create_capture_node(
+        store,
+        topics=["preferences", "facts", "instructions"],
+        fire_and_forget=True,  # Don't block the response
     )
 
-    # Memory namespace for this user
-    user_ns = ("memories", "user_id", user_id)
-    user_scope = {"user_id": user_id}
-
-    # ── Graph nodes ─────────────────────────────────────────────────
-
-    def recall_memories(state: ChatState) -> dict[str, Any]:
-        """Retrieve relevant memories before generating a response."""
-        messages = state["messages"]
-        if not messages:
-            return {"memories": ""}
-
-        # Use the last user message as the search query
-        last_msg = messages[-1]
-        query = last_msg.content if isinstance(last_msg.content, str) else str(last_msg.content)
-
-        try:
-            results = store.search(user_ns, query=query, limit=5)
-            if results:
-                facts = [r.value.get("fact", "") for r in results if r.value.get("fact")]
-                memory_context = "\n".join(f"- {fact}" for fact in facts)
-                return {"memories": memory_context}
-        except Exception as e:
-            print(f"  [Memory recall failed: {e}]")
-
-        return {"memories": ""}
-
-    def generate_response(state: ChatState) -> dict[str, Any]:
-        """Generate a response using the LLM with memory context."""
+    def respond(state: ChatState) -> dict[str, Any]:
+        """Generate a response using the LLM."""
         messages = list(state["messages"])
-        memories = state.get("memories", "")
-
-        # Build system message with memory context
-        system_parts = ["You are a helpful, friendly assistant."]
-        if memories:
-            system_parts.append(
-                f"\nYou remember the following about this user:\n{memories}\n"
-                "Use these memories naturally in conversation when relevant. "
-                "Don't list them explicitly unless asked."
-            )
-
-        system_msg = SystemMessage(content="\n".join(system_parts))
-
-        # Prepend system message
-        full_messages = [system_msg] + messages
-
-        response = llm.invoke(full_messages)
+        response = llm.invoke(messages)
         return {"messages": [response]}
 
-    def save_memories(state: ChatState) -> dict[str, Any]:
-        """Extract and save memories from the conversation turn."""
-        messages = state["messages"]
-        if len(messages) < 2:
-            return {}
-
-        # Get the last user-assistant exchange
-        recent_events = []
-        for msg in messages[-2:]:
-            role = "user" if isinstance(msg, HumanMessage) else "model"
-            text = msg.content if isinstance(msg.content, str) else str(msg.content)
-            recent_events.append({
-                "content": {"role": role, "parts": [{"text": text}]}
-            })
-
-        try:
-            store.generate_memories(
-                scope=user_scope,
-                events=recent_events,
-                wait_for_completion=False,  # Don't block on memory generation
-            )
-        except Exception as e:
-            print(f"  [Memory save failed: {e}]")
-
-        return {}
-
-    # ── Build graph ─────────────────────────────────────────────────
-
+    # Build graph: recall → respond → capture
     graph = StateGraph(ChatState)
-    graph.add_node("recall", recall_memories)
-    graph.add_node("respond", generate_response)
-    graph.add_node("save", save_memories)
+    graph.add_node("recall", recall)
+    graph.add_node("respond", respond)
+    graph.add_node("capture", capture)
 
     graph.add_edge(START, "recall")
     graph.add_edge("recall", "respond")
-    graph.add_edge("respond", "save")
-    graph.add_edge("save", END)
+    graph.add_edge("respond", "capture")
+    graph.add_edge("capture", END)
 
     # Use MemorySaver for within-session conversation state
     checkpointer = MemorySaver()
@@ -183,8 +130,8 @@ def run_interactive(user_id: str = "demo-user") -> None:
 
     graph, store = create_chatbot(user_id)
     session_id = uuid.uuid4().hex[:8]
-    config = {"configurable": {"thread_id": f"session-{session_id}"}}
-    user_ns = ("memories", "user_id", user_id)
+    config = {"configurable": {"thread_id": f"session-{session_id}", "user_id": user_id}}
+    user_ns = store.namespace_for_scope({"user_id": user_id})
 
     print(f"   Session: {session_id}\n")
 
@@ -202,7 +149,7 @@ def run_interactive(user_id: str = "demo-user") -> None:
             break
         if user_input.lower() == "new":
             session_id = uuid.uuid4().hex[:8]
-            config = {"configurable": {"thread_id": f"session-{session_id}"}}
+            config = {"configurable": {"thread_id": f"session-{session_id}", "user_id": user_id}}
             print(f"\n--- New session: {session_id} ---\n")
             continue
         if user_input.lower() == "memories":
@@ -212,7 +159,8 @@ def run_interactive(user_id: str = "demo-user") -> None:
                     print("\n📝 Stored memories:")
                     for r in results:
                         fact = r.value.get("fact", "?")
-                        print(f"   • {fact}")
+                        score = f" ({r.score:.2f})" if r.score else ""
+                        print(f"   • {fact}{score}")
                     print()
                 else:
                     print("\n   No memories stored yet.\n")
@@ -222,7 +170,7 @@ def run_interactive(user_id: str = "demo-user") -> None:
 
         # Run the graph
         result = graph.invoke(
-            {"messages": [HumanMessage(content=user_input)], "user_id": user_id, "memories": ""},
+            {"messages": [HumanMessage(content=user_input)], "user_id": user_id},
             config=config,
         )
 

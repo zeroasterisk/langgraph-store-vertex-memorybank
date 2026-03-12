@@ -1,185 +1,245 @@
-# langgraph-store-vertex-memorybank
+# langgraph-vertex-memorybank
 
-LangGraph [`BaseStore`](https://langchain-ai.github.io/langgraph/concepts/memory/) implementation backed by [Vertex AI Agent Engine Memory Bank](https://cloud.google.com/vertex-ai/generative-ai/docs/agent-engine/memory-bank/overview).
+LangGraph `BaseStore` backed by [Vertex AI Agent Engine Memory Bank](https://cloud.google.com/vertex-ai/generative-ai/docs/agent-engine/memory-bank/overview) — LLM-powered long-term memory with automatic extraction, consolidation, and semantic recall.
 
-## What is this?
+## Why Memory Bank?
 
-This package provides a drop-in LangGraph store that gives your agents **persistent, semantic long-term memory** powered by Google Cloud's managed Memory Bank service.
+Unlike `InMemoryStore` which loses data on restart, or vector stores that just embed raw text, Memory Bank uses an LLM to extract meaningful facts and consolidates them over time:
 
-Unlike simple vector stores, Memory Bank uses an **LLM to extract meaningful facts** from conversations and **consolidates** them with existing memories over time — deduplicating, updating, and even deleting contradicted information automatically.
+- **LLM-powered extraction** — not just embedding, but understanding: "I moved to Portland last year" becomes the fact "User lives in Portland"
+- **Automatic consolidation** — duplicate or updated facts are merged, not duplicated
+- **Managed infrastructure** — no vector DB to run, scale, or maintain
+- **Per-user scoping** — memories are isolated per user, session, or any scope you define
 
-## Key Features
-
-- **LangGraph-native**: Implements `BaseStore` — works with `graph.compile(store=...)` and LangGraph's memory patterns
-- **Semantic search**: `store.search(namespace, query="...")` uses Memory Bank's similarity search
-- **LLM-powered extraction**: `store.generate_memories()` extracts facts from conversation turns (Memory Bank's killer feature)
-- **Scoped isolation**: Memories are isolated per user/session via namespace-to-scope mapping
-- **Managed infrastructure**: No vector DB to manage — Memory Bank handles storage, embeddings, and consolidation
-
-## Installation
+## Install
 
 ```bash
-pip install langgraph-store-vertex-memorybank
+pip install langgraph-vertex-memorybank
 ```
 
-Or from source:
-
-```bash
-git clone https://github.com/zeroasterisk/langgraph-store-vertex-memorybank
-cd langgraph-store-vertex-memorybank
-pip install -e ".[dev,sample]"
-```
-
-## Prerequisites
-
-1. **Google Cloud project** with billing enabled
-2. **Vertex AI API** enabled
-3. **Agent Engine instance** with Memory Bank — [set up guide](https://cloud.google.com/vertex-ai/generative-ai/docs/agent-engine/memory-bank/set-up)
-4. **Authentication** via Application Default Credentials:
-   ```bash
-   gcloud auth application-default login
-   ```
+Requires Python 3.10+ and a Google Cloud project with [Memory Bank enabled](https://cloud.google.com/vertex-ai/generative-ai/docs/agent-engine/memory-bank/overview).
 
 ## Quick Start
 
+### 1. Create the Store
+
 ```python
-from langgraph_store_vertex_memorybank import VertexMemoryBankStore
+from langgraph_vertex_memorybank import VertexMemoryBankStore
 
 store = VertexMemoryBankStore(
-    project_id="your-project",
+    project_id="my-project",
     location="us-central1",
-    reasoning_engine_id="your-engine-id",
+    reasoning_engine_id="123456",
 )
+```
 
-# Store a memory
-store.put(
-    ("memories", "user_id", "alice"),
-    "pref-1",
-    {"fact": "Alice prefers dark mode"},
+Or pass an existing `vertexai.Client`:
+
+```python
+import vertexai
+
+client = vertexai.Client(project="my-project", location="us-central1")
+store = VertexMemoryBankStore(
+    project_id="my-project",
+    location="us-central1",
+    reasoning_engine_id="123456",
+    client=client,
 )
+```
 
+### 2. Use as a LangGraph BaseStore
+
+```python
 # Search memories (semantic similarity)
 results = store.search(
     ("memories", "user_id", "alice"),
-    query="What UI preferences does the user have?",
+    query="What does the user prefer?",
     limit=5,
 )
-for r in results:
-    print(f"  {r.value['fact']} (score: {r.score})")
+
+# Create a memory directly
+store.put(
+    ("memories", "user_id", "alice"),
+    "key",
+    {"fact": "User prefers dark mode"},
+)
+
+# Get a memory by ID
+item = store.get(("memories", "user_id", "alice"), "memory-id")
+
+# Delete a memory
+store.delete(("memories", "user_id", "alice"), "memory-id")
+```
+
+### 3. Wire into a LangGraph Agent (Pre-built Nodes)
+
+The fastest way — use `create_recall_node` and `create_capture_node`:
+
+```python
+from langgraph.graph import StateGraph, START, END
+from langgraph.graph.message import MessagesState
+from langgraph_vertex_memorybank import (
+    VertexMemoryBankStore,
+    create_recall_node,
+    create_capture_node,
+)
+
+store = VertexMemoryBankStore(...)
+
+# recall: searches Memory Bank, injects facts as a system message
+recall = create_recall_node(store, recall_mode="system", top_k=5)
+
+# capture: extracts memories from conversation (fire-and-forget)
+capture = create_capture_node(store, topics=["preferences", "facts"])
+
+builder = StateGraph(MessagesState)
+builder.add_node("recall", recall)
+builder.add_node("agent", your_agent_fn)
+builder.add_node("capture", capture)
+
+builder.add_edge(START, "recall")
+builder.add_edge("recall", "agent")
+builder.add_edge("agent", "capture")
+builder.add_edge("capture", END)
+
+graph = builder.compile()
+
+# Invoke with user_id in config
+result = graph.invoke(
+    {"messages": [HumanMessage(content="Hi!")]},
+    {"configurable": {"user_id": "alice"}},
+)
+```
+
+The recall node:
+- Gets `user_id` from `config["configurable"]["user_id"]`
+- Searches memories using the last user message as the query
+- Injects matching facts as a `SystemMessage` (or into `state["memory_context"]` with `recall_mode="state"`)
+
+The capture node:
+- Converts recent messages to Memory Bank event format
+- Calls `generate_memories()` for LLM-powered fact extraction
+- Runs in a background thread by default (doesn't block the response)
+
+### 4. Generate Memories from Conversations
+
+Memory Bank's core feature — LLM-powered fact extraction:
+
+```python
+events = [
+    {"content": {"role": "user", "parts": [{"text": "I just moved to Portland. I love hiking and coffee."}]}},
+    {"content": {"role": "model", "parts": [{"text": "Welcome to Portland! Great city for both."}]}},
+]
+
+op = store.generate_memories(
+    scope={"user_id": "alice"},
+    events=events,
+    topics=["preferences", "facts"],
+)
+# Memory Bank extracts: "User lives in Portland", "User loves hiking", "User loves coffee"
 ```
 
 ## Namespace Mapping
 
-LangGraph uses namespace tuples; Memory Bank uses scope dicts. This store maps between them:
+LangGraph uses namespace tuples. This store maps them to Memory Bank scopes:
 
-| LangGraph Namespace | Memory Bank Scope |
-|---|---|
-| `("memories", "user_id", "alice")` | `{"user_id": "alice"}` |
-| `("memories", "user_id", "alice", "session", "s1")` | `{"user_id": "alice", "session": "s1"}` |
+| Namespace | Scope | Topic Filter |
+|-----------|-------|-------------|
+| `("memories", "user_id", "alice")` | `{"user_id": "alice"}` | None (all topics) |
+| `("memories", "user_id", "alice", "topic", "preferences")` | `{"user_id": "alice"}` | `"preferences"` |
+| `("memories", "user_id", "alice", "agent", "bot1")` | `{"user_id": "alice", "agent": "bot1"}` | None |
 
-The first element is the prefix (default: `"memories"`), remaining elements are alternating key-value pairs.
+Format: `(prefix, key1, value1, key2, value2, ..., ["topic", topic_name])`
 
-## Memory Generation (The Killer Feature)
-
-Memory Bank doesn't just store text — it uses an LLM to extract facts:
+## Configuration
 
 ```python
-events = [
-    {"content": {"role": "user", "parts": [{"text": "I just moved to Portland. I'm a Python developer."}]}},
-    {"content": {"role": "model", "parts": [{"text": "Welcome to Portland! Great city for tech."}]}},
-]
+store = VertexMemoryBankStore(
+    project_id="my-project",
+    location="us-central1",
+    reasoning_engine_id="123456",
 
-results = store.generate_memories(
+    # Optional
+    client=vertexai.Client(...),       # Use existing client
+    default_top_k=10,                  # Search result count
+    min_similarity_score=0.3,          # Filter low-relevance results
+    topics=["preferences", "facts"],   # Default extraction topics
+    disable_consolidation=False,       # Skip dedup/merge
+    revision_labels={"source": "app"}, # Labels on generated memories
+    namespace_prefix="memories",       # Namespace prefix
+)
+```
+
+## Authentication
+
+Uses standard Google Cloud authentication via the `google-cloud-aiplatform` SDK:
+
+- **Application Default Credentials (ADC)** — `gcloud auth application-default login`
+- **Service Account** — `GOOGLE_APPLICATION_CREDENTIALS=/path/to/key.json`
+- **Explicit credentials** — pass to `vertexai.Client(credentials=...)`
+
+## Advanced
+
+### Similarity Scoring
+
+Memory Bank returns Euclidean distance. We convert to similarity: `score = 1 / (1 + distance)`. Memories below `min_similarity_score` (default 0.3) are filtered out.
+
+### Revision Labels
+
+Optional labels attached to generated memories for tracking provenance:
+
+```python
+store = VertexMemoryBankStore(
+    ...,
+    revision_labels={"source": "langgraph", "version": "2.0"},
+)
+```
+
+### Custom Topics
+
+Topics scope what kind of facts Memory Bank extracts:
+
+```python
+store.generate_memories(
     scope={"user_id": "alice"},
     events=events,
+    topics=["dietary_preferences", "travel_history", "technical_skills"],
 )
-# Memory Bank extracts: "Lives in Portland", "Is a Python developer"
-# and consolidates with existing memories (dedup, update, delete contradictions)
 ```
 
-## Using with LangGraph
+### Async Support
+
+All BaseStore methods have async counterparts, and `generate_memories` has `agenerate_memories`:
 
 ```python
-from langgraph.graph import StateGraph
-from langgraph.checkpoint.memory import MemorySaver
-
-store = VertexMemoryBankStore(...)
-
-def recall_node(state, *, store):
-    results = store.search(
-        ("memories", "user_id", state["user_id"]),
-        query=state["messages"][-1].content,
-        limit=5,
-    )
-    facts = [r.value["fact"] for r in results]
-    return {"context": "\n".join(facts)}
-
-graph = StateGraph(...)
-graph.add_node("recall", recall_node)
-# ...
-compiled = graph.compile(store=store, checkpointer=MemorySaver())
+results = await store.asearch(namespace, query="...", limit=5)
+await store.aput(namespace, "key", {"fact": "..."})
+op = await store.agenerate_memories(scope, events)
 ```
 
-## Sample Chatbot
+## Sample App
 
-A full interactive chatbot demo is included:
+See [`sample/chatbot.py`](sample/chatbot.py) for a complete interactive chatbot using Gemini + Memory Bank:
 
 ```bash
-# Install sample dependencies
-pip install -e ".[sample]"
-
-# Set config
-export GCP_PROJECT_ID=your-project
-export REASONING_ENGINE_ID=your-engine-id
-
-# Run
+pip install "langgraph-vertex-memorybank[sample]"
 python sample/chatbot.py --user alice
 ```
 
-The sample demonstrates:
-- Memory recall before each response
-- Memory extraction after each conversation turn
-- Cross-session continuity (type `new` to start a new session)
-- Memory inspection (type `memories` to list stored facts)
-
-## API Reference
-
-### `VertexMemoryBankStore`
-
-| Method | Description |
-|---|---|
-| `get(namespace, key)` | Get a single memory by ID |
-| `search(namespace, query=..., filter=..., limit=...)` | Semantic search or list memories |
-| `put(namespace, key, value)` | Create a memory directly |
-| `delete(namespace, key)` | Delete a memory |
-| `list_namespaces(prefix=..., suffix=...)` | List known memory scopes |
-| `generate_memories(scope, events)` | **Extract facts from conversation** (Memory Bank feature) |
-
-All methods have async counterparts (`aget`, `asearch`, `aput`, etc.).
-
-## Testing
+## Development
 
 ```bash
-# Unit tests (mocked, no GCP needed)
-pytest -m "not integration"
+git clone https://github.com/zeroasterisk/langgraph-store-vertex-memorybank
+cd langgraph-store-vertex-memorybank
+uv venv && source .venv/bin/activate
+uv pip install -e ".[dev]"
 
-# Integration tests (requires GCP credentials)
-export GCP_PROJECT_ID=your-project
-export REASONING_ENGINE_ID=your-engine-id
-pytest -m integration
+# Run unit tests (no GCP needed)
+pytest -m "not integration" -v
+
+# Run integration tests (needs GCP auth)
+pytest -m integration -v
 ```
-
-## Design Decisions
-
-1. **BaseStore, not BaseCheckpointSaver**: Memory Bank is a semantic memory store, not a conversation state checkpoint. LangGraph's `BaseStore` (cross-thread memory) is the right abstraction. Use `MemorySaver` or `PostgresSaver` for conversation checkpointing alongside this store.
-
-2. **Namespace-to-scope mapping**: We map LangGraph's hierarchical namespace tuples to Memory Bank's flat scope dicts using alternating key-value pairs. This preserves both models' semantics.
-
-3. **generate_memories() as an extension**: Memory Bank's LLM-powered extraction doesn't fit neatly into BaseStore's `put()`. We expose it as an additional method that LangGraph nodes can call explicitly.
-
-4. **urllib for HTTP**: We use stdlib `urllib` instead of adding `httpx`/`requests` as a dependency, keeping the package lightweight. The Memory Bank API is simple REST.
-
-5. **Client-side filtering**: Memory Bank's filter API uses metadata filters. We apply LangGraph-style `filter={"key": "value"}` client-side against memory metadata.
 
 ## License
 

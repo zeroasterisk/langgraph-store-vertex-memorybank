@@ -1,6 +1,6 @@
 """Unit tests for VertexMemoryBankStore.
 
-All API calls are mocked — no real GCP credentials needed.
+All SDK calls are mocked — no real GCP credentials needed.
 """
 
 from __future__ import annotations
@@ -8,519 +8,636 @@ from __future__ import annotations
 import json
 from datetime import datetime, timezone
 from typing import Any
-from unittest.mock import MagicMock, patch
+from unittest.mock import MagicMock, PropertyMock, patch
 
 import pytest
 
-from langgraph_store_vertex_memorybank.store import (
+from langgraph_vertex_memorybank.store import (
     VertexMemoryBankStore,
+    _distance_to_score,
     _extract_memory_id,
-    _memory_resource_name,
-    _memory_to_item,
-    _memory_to_search_item,
-    _namespace_to_scope,
+    _filter_namespaces,
+    _parse_namespace,
     _scope_to_namespace,
+    _sdk_memory_to_item,
+    _sdk_retrieved_to_search_item,
 )
+from langgraph.store.base import MatchCondition
 
 
 # ── Helpers ─────────────────────────────────────────────────────────────
 
 
-def _make_store() -> VertexMemoryBankStore:
-    """Create a store with mocked credentials."""
-    with patch("langgraph_store_vertex_memorybank.store.google_auth_default") as mock_auth:
-        mock_creds = MagicMock()
-        mock_creds.valid = True
-        mock_creds.token = "fake-token"
-        mock_auth.return_value = (mock_creds, "test-project")
-        store = VertexMemoryBankStore(
+@pytest.fixture
+def mock_memories():
+    """Create a mock memories sub-resource."""
+    return MagicMock()
+
+
+@pytest.fixture
+def store(mock_memories):
+    """Create a store with mocked SDK client and memories."""
+    with patch("langgraph_vertex_memorybank.store.vertexai.Client"):
+        s = VertexMemoryBankStore(
             project_id="test-project",
             location="us-central1",
             reasoning_engine_id="123456",
-            credentials=mock_creds,
         )
-    return store
+    # Directly replace the client's memories accessor
+    s._client = MagicMock()
+    s._client.agent_engines.memories = mock_memories
+    s._client.aio.agent_engines.memories = mock_memories
+    return s
 
 
-def _mock_memory(
+def _make_store(**kwargs: Any) -> tuple[MagicMock, VertexMemoryBankStore]:
+    """Create a store with a mocked SDK client. Returns (mock_memories, store)."""
+    mock_memories = MagicMock()
+    with patch("langgraph_vertex_memorybank.store.vertexai.Client"):
+        defaults = dict(
+            project_id="test-project",
+            location="us-central1",
+            reasoning_engine_id="123456",
+        )
+        defaults.update(kwargs)
+        s = VertexMemoryBankStore(**defaults)
+    s._client = MagicMock()
+    s._client.agent_engines.memories = mock_memories
+    s._client.aio.agent_engines.memories = mock_memories
+    return mock_memories, s
+
+
+def _mock_sdk_memory(
     memory_id: str = "mem-1",
     fact: str = "User likes Python",
     scope: dict[str, str] | None = None,
-) -> dict[str, Any]:
-    """Create a mock memory response."""
-    return {
-        "name": f"projects/test-project/locations/us-central1/reasoningEngines/123456/memories/{memory_id}",
-        "scope": scope or {"user_id": "alice"},
-        "fact": fact,
-        "metadata": {},
-        "createTime": "2026-01-15T10:00:00Z",
-        "updateTime": "2026-01-15T10:30:00Z",
-    }
+) -> MagicMock:
+    """Create a mock SDK Memory object."""
+    mem = MagicMock()
+    mem.name = (
+        f"projects/test-project/locations/us-central1"
+        f"/reasoningEngines/123456/memories/{memory_id}"
+    )
+    mem.fact = fact
+    mem.scope = scope or {"user_id": "alice"}
+    mem.metadata = None
+    mem.create_time = datetime(2026, 1, 15, 10, 0, 0, tzinfo=timezone.utc)
+    mem.update_time = datetime(2026, 1, 15, 10, 30, 0, tzinfo=timezone.utc)
+    return mem
 
 
-# ── Namespace/Scope mapping tests ──────────────────────────────────────
+def _mock_sdk_retrieved(
+    memory_id: str = "mem-1",
+    fact: str = "User likes Python",
+    scope: dict[str, str] | None = None,
+    distance: float | None = None,
+) -> MagicMock:
+    """Create a mock SDK RetrieveMemoriesResponseRetrievedMemory."""
+    retrieved = MagicMock()
+    retrieved.memory = _mock_sdk_memory(memory_id, fact, scope)
+    retrieved.distance = distance
+    return retrieved
 
 
-class TestNamespaceMapping:
-    def test_namespace_to_scope_basic(self) -> None:
-        ns = ("memories", "user_id", "alice")
-        assert _namespace_to_scope(ns) == {"user_id": "alice"}
+# ── Namespace / Scope mapping ───────────────────────────────────────────
 
-    def test_namespace_to_scope_multiple_keys(self) -> None:
-        ns = ("memories", "user_id", "alice", "session_id", "s1")
-        assert _namespace_to_scope(ns) == {"user_id": "alice", "session_id": "s1"}
 
-    def test_namespace_to_scope_too_short(self) -> None:
-        with pytest.raises(ValueError, match="at least 3 elements"):
-            _namespace_to_scope(("memories",))
+class TestParseNamespace:
+    def test_basic(self) -> None:
+        scope, topic = _parse_namespace(("memories", "user_id", "alice"))
+        assert scope == {"user_id": "alice"}
+        assert topic is None
 
-    def test_namespace_to_scope_odd_pairs(self) -> None:
+    def test_multiple_keys(self) -> None:
+        scope, topic = _parse_namespace(("memories", "user_id", "alice", "session_id", "s1"))
+        assert scope == {"user_id": "alice", "session_id": "s1"}
+        assert topic is None
+
+    def test_with_topic(self) -> None:
+        scope, topic = _parse_namespace(
+            ("memories", "user_id", "alice", "topic", "preferences")
+        )
+        assert scope == {"user_id": "alice"}
+        assert topic == "preferences"
+
+    def test_multiple_keys_with_topic(self) -> None:
+        scope, topic = _parse_namespace(
+            ("memories", "user_id", "alice", "agent", "bot1", "topic", "facts")
+        )
+        assert scope == {"user_id": "alice", "agent": "bot1"}
+        assert topic == "facts"
+
+    def test_too_short(self) -> None:
+        with pytest.raises(ValueError, match=">= 3"):
+            _parse_namespace(("memories",))
+
+    def test_odd_pairs(self) -> None:
         with pytest.raises(ValueError):
-            _namespace_to_scope(("memories", "user_id"))
+            _parse_namespace(("memories", "user_id"))
 
-    def test_scope_to_namespace_basic(self) -> None:
-        scope = {"user_id": "alice"}
-        result = _scope_to_namespace(scope)
-        assert result == ("memories", "user_id", "alice")
+    def test_only_topic_raises(self) -> None:
+        with pytest.raises(ValueError, match="non-topic"):
+            _parse_namespace(("memories", "topic", "preferences"))
 
-    def test_scope_to_namespace_sorted_keys(self) -> None:
-        scope = {"z_key": "z_val", "a_key": "a_val"}
-        result = _scope_to_namespace(scope)
-        assert result == ("memories", "a_key", "a_val", "z_key", "z_val")
 
-    def test_scope_to_namespace_custom_prefix(self) -> None:
-        scope = {"user_id": "bob"}
-        result = _scope_to_namespace(scope, prefix="user_memories")
-        assert result == ("user_memories", "user_id", "bob")
+class TestScopeToNamespace:
+    def test_basic(self) -> None:
+        assert _scope_to_namespace({"user_id": "alice"}) == ("memories", "user_id", "alice")
+
+    def test_sorted_keys(self) -> None:
+        result = _scope_to_namespace({"z_key": "z", "a_key": "a"})
+        assert result == ("memories", "a_key", "a", "z_key", "z")
+
+    def test_custom_prefix(self) -> None:
+        result = _scope_to_namespace({"user_id": "bob"}, prefix="custom")
+        assert result == ("custom", "user_id", "bob")
+
+    def test_with_topic(self) -> None:
+        result = _scope_to_namespace({"user_id": "alice"}, topic="prefs")
+        assert result == ("memories", "user_id", "alice", "topic", "prefs")
 
     def test_roundtrip(self) -> None:
         scope = {"user_id": "alice", "agent": "chatbot"}
         ns = _scope_to_namespace(scope)
-        recovered = _namespace_to_scope(ns)
+        recovered, topic = _parse_namespace(ns)
         assert recovered == scope
+        assert topic is None
+
+    def test_roundtrip_with_topic(self) -> None:
+        scope = {"user_id": "alice"}
+        ns = _scope_to_namespace(scope, topic="facts")
+        recovered, topic = _parse_namespace(ns)
+        assert recovered == scope
+        assert topic == "facts"
 
 
-# ── Resource name tests ─────────────────────────────────────────────────
+# ── Distance / Score ────────────────────────────────────────────────────
 
 
-class TestResourceNames:
-    def test_memory_resource_name(self) -> None:
-        name = _memory_resource_name("proj", "us-c1", "eng1", "mem1")
-        assert name == "projects/proj/locations/us-c1/reasoningEngines/eng1/memories/mem1"
+class TestDistanceToScore:
+    def test_zero_distance(self) -> None:
+        assert _distance_to_score(0.0) == 1.0
 
-    def test_extract_memory_id(self) -> None:
+    def test_positive_distance(self) -> None:
+        score = _distance_to_score(0.5)
+        assert score is not None
+        assert abs(score - 0.6667) < 0.001
+
+    def test_none(self) -> None:
+        assert _distance_to_score(None) is None
+
+
+# ── Resource name helpers ───────────────────────────────────────────────
+
+
+class TestExtractMemoryId:
+    def test_full_name(self) -> None:
         name = "projects/p/locations/l/reasoningEngines/e/memories/abc123"
         assert _extract_memory_id(name) == "abc123"
 
-    def test_extract_memory_id_short(self) -> None:
+    def test_short_name(self) -> None:
         assert _extract_memory_id("abc123") == "abc123"
 
 
-# ── Memory to Item conversion tests ─────────────────────────────────────
+# ── SDK Memory conversion ──────────────────────────────────────────────
 
 
-class TestMemoryConversion:
+class TestSDKMemoryConversion:
     def test_memory_to_item(self) -> None:
-        mem = _mock_memory("m1", "Likes hiking")
+        mem = _mock_sdk_memory("m1", "Likes hiking")
         ns = ("memories", "user_id", "alice")
-        item = _memory_to_item(mem, ns)
+        item = _sdk_memory_to_item(mem, ns)
 
         assert item.key == "m1"
         assert item.namespace == ns
         assert item.value["fact"] == "Likes hiking"
         assert item.created_at.year == 2026
 
-    def test_memory_to_search_item_with_distance(self) -> None:
-        mem_result = {
-            "memory": _mock_memory("m2", "Prefers dark mode"),
-            "distance": 0.5,
-        }
+    def test_retrieved_to_search_item_with_distance(self) -> None:
+        retrieved = _mock_sdk_retrieved("m2", "Prefers dark mode", distance=0.5)
         ns = ("memories", "user_id", "alice")
-        item = _memory_to_search_item(mem_result, ns)
+        item = _sdk_retrieved_to_search_item(retrieved, ns)
 
         assert item.key == "m2"
         assert item.value["fact"] == "Prefers dark mode"
-        # score = 1 / (1 + 0.5) = 0.666...
         assert item.score is not None
         assert abs(item.score - 0.6667) < 0.001
 
-    def test_memory_to_search_item_no_distance(self) -> None:
-        mem_result = {"memory": _mock_memory("m3", "Lives in Portland")}
+    def test_retrieved_to_search_item_no_distance(self) -> None:
+        retrieved = _mock_sdk_retrieved("m3", "Lives in Portland", distance=None)
         ns = ("memories", "user_id", "alice")
-        item = _memory_to_search_item(mem_result, ns)
-
+        item = _sdk_retrieved_to_search_item(retrieved, ns)
         assert item.score is None
 
+    def test_memory_with_metadata(self) -> None:
+        mem = _mock_sdk_memory("m4", "Has a dog")
+        meta_val = MagicMock()
+        meta_val.string_value = "pet_info"
+        meta_val.double_value = None
+        meta_val.bool_value = None
+        mem.metadata = {"category": meta_val}
 
-# ── Store operation tests ───────────────────────────────────────────────
+        ns = ("memories", "user_id", "alice")
+        item = _sdk_memory_to_item(mem, ns)
+        assert item.value["metadata"]["category"] == "pet_info"
+
+
+# ── Store: Get ──────────────────────────────────────────────────────────
 
 
 class TestStoreGet:
-    def test_get_found(self) -> None:
-        store = _make_store()
-        mem = _mock_memory("mem-1", "Likes Python")
-        with patch.object(store, "_make_request", return_value=mem):
-            result = store.get(("memories", "user_id", "alice"), "mem-1")
+    def test_get_found(self, store, mock_memories) -> None:
+        mem = _mock_sdk_memory("mem-1", "Likes Python")
+        mock_memories.get.return_value = mem
+
+        result = store.get(("memories", "user_id", "alice"), "mem-1")
 
         assert result is not None
         assert result.key == "mem-1"
         assert result.value["fact"] == "Likes Python"
+        mock_memories.get.assert_called_once_with(
+            name="projects/test-project/locations/us-central1/reasoningEngines/123456/memories/mem-1"
+        )
 
-    def test_get_not_found(self) -> None:
-        store = _make_store()
-        with patch.object(
-            store, "_make_request", side_effect=RuntimeError("API error 404: Not Found")
-        ):
-            result = store.get(("memories", "user_id", "alice"), "nonexistent")
-
+    def test_get_not_found(self, store, mock_memories) -> None:
+        mock_memories.get.side_effect = Exception("404 NOT_FOUND")
+        result = store.get(("memories", "user_id", "alice"), "nonexistent")
         assert result is None
 
-    def test_get_other_error_raises(self) -> None:
-        store = _make_store()
-        with patch.object(
-            store, "_make_request", side_effect=RuntimeError("API error 500: Internal")
-        ):
-            with pytest.raises(RuntimeError, match="500"):
-                store.get(("memories", "user_id", "alice"), "mem-1")
+    def test_get_other_error_raises(self, store, mock_memories) -> None:
+        mock_memories.get.side_effect = Exception("500 Internal Server Error")
+        with pytest.raises(Exception, match="500"):
+            store.get(("memories", "user_id", "alice"), "mem-1")
+
+
+# ── Store: Search ───────────────────────────────────────────────────────
 
 
 class TestStoreSearch:
-    def test_search_with_query(self) -> None:
-        store = _make_store()
-        response = {
-            "retrievedMemories": [
-                {"memory": _mock_memory("m1", "Lives in Portland"), "distance": 0.3},
-                {"memory": _mock_memory("m2", "Likes coffee"), "distance": 0.7},
-            ]
-        }
-        with patch.object(store, "_make_request", return_value=response) as mock_req:
-            results = store.search(
-                ("memories", "user_id", "alice"),
-                query="Where does the user live?",
-                limit=5,
-            )
+    def test_search_with_query(self, store, mock_memories) -> None:
+        mock_memories.retrieve.return_value = [
+            _mock_sdk_retrieved("m1", "Lives in Portland", distance=0.3),
+            _mock_sdk_retrieved("m2", "Likes coffee", distance=0.7),
+        ]
+
+        results = store.search(
+            ("memories", "user_id", "alice"),
+            query="Where does the user live?",
+            limit=5,
+        )
 
         assert len(results) == 2
         assert results[0].value["fact"] == "Lives in Portland"
         assert results[0].score is not None
         assert results[0].score > results[1].score  # type: ignore[operator]
 
-        # Verify API call
-        mock_req.assert_called_once()
-        body = _get_body(mock_req)
-        assert body["scope"] == {"user_id": "alice"}
-        assert body["similaritySearchParams"]["searchQuery"] == "Where does the user live?"
+        call_kwargs = mock_memories.retrieve.call_args.kwargs
+        assert call_kwargs["scope"] == {"user_id": "alice"}
+        assert call_kwargs["similarity_search_params"]["search_query"] == "Where does the user live?"
 
-    def test_search_without_query(self) -> None:
-        store = _make_store()
-        response = {
-            "retrievedMemories": [
-                {"memory": _mock_memory("m1", "Fact 1")},
-            ]
-        }
-        with patch.object(store, "_make_request", return_value=response):
-            results = store.search(("memories", "user_id", "alice"))
-
+    def test_search_without_query(self, store, mock_memories) -> None:
+        mock_memories.retrieve.return_value = [
+            _mock_sdk_retrieved("m1", "Fact 1"),
+        ]
+        results = store.search(("memories", "user_id", "alice"))
         assert len(results) == 1
 
-    def test_search_with_filter(self) -> None:
-        store = _make_store()
-        response = {
-            "retrievedMemories": [
-                {
-                    "memory": {
-                        **_mock_memory("m1", "Pref 1"),
-                        "metadata": {"category": "preference"},
-                    }
-                },
-                {
-                    "memory": {
-                        **_mock_memory("m2", "Info 1"),
-                        "metadata": {"category": "info"},
-                    }
-                },
-            ]
-        }
-        with patch.object(store, "_make_request", return_value=response):
-            results = store.search(
-                ("memories", "user_id", "alice"),
-                filter={"category": "preference"},
-            )
+    def test_search_with_topic_namespace(self, store, mock_memories) -> None:
+        mock_memories.retrieve.return_value = [
+            _mock_sdk_retrieved("m1", "Prefers dark mode", distance=0.2),
+        ]
 
-        # Client-side filter should only return the preference
+        results = store.search(
+            ("memories", "user_id", "alice", "topic", "preferences"),
+            query="UI theme",
+        )
+
+        assert len(results) == 1
+        call_kwargs = mock_memories.retrieve.call_args.kwargs
+        assert call_kwargs["scope"] == {"user_id": "alice"}
+        assert "preferences" in call_kwargs.get("config", {}).get("filter", "")
+
+    def test_search_with_filter(self, store, mock_memories) -> None:
+        mock_memories.retrieve.return_value = [
+            _mock_sdk_retrieved("m1", "Pref 1"),
+            _mock_sdk_retrieved("m2", "Info 1"),
+        ]
+
+        results = store.search(
+            ("memories", "user_id", "alice"),
+            filter={"fact": "Pref 1"},
+        )
         assert len(results) == 1
         assert results[0].value["fact"] == "Pref 1"
 
-    def test_search_bad_namespace_returns_empty(self) -> None:
-        store = _make_store()
+    def test_search_min_similarity_filter(self) -> None:
+        mock_memories, s = _make_store(min_similarity_score=0.5)
+        mock_memories.retrieve.return_value = [
+            _mock_sdk_retrieved("m1", "Good match", distance=0.3),
+            _mock_sdk_retrieved("m2", "Bad match", distance=5.0),
+        ]
+
+        results = s.search(
+            ("memories", "user_id", "alice"),
+            query="test",
+        )
+        assert len(results) == 1
+        assert results[0].value["fact"] == "Good match"
+
+    def test_search_bad_namespace_returns_empty(self, store) -> None:
         results = store.search(("too_short",))
         assert results == []
 
-    def test_search_api_error_returns_empty(self) -> None:
-        store = _make_store()
-        with patch.object(
-            store, "_make_request", side_effect=RuntimeError("API error 503")
-        ):
-            results = store.search(("memories", "user_id", "alice"))
-
+    def test_search_api_error_returns_empty(self, store, mock_memories) -> None:
+        mock_memories.retrieve.side_effect = Exception("503 Unavailable")
+        results = store.search(("memories", "user_id", "alice"))
         assert results == []
 
+    def test_search_respects_limit_and_offset(self, store, mock_memories) -> None:
+        mock_memories.retrieve.return_value = [
+            _mock_sdk_retrieved(f"m{i}", f"Fact {i}") for i in range(10)
+        ]
 
-def _get_body(mock_req: MagicMock) -> dict[str, Any]:
-    """Extract the json_body from a mock _make_request call."""
-    call_args = mock_req.call_args
-    if call_args[1] and "json_body" in call_args[1]:
-        return call_args[1]["json_body"]
-    # Positional args: method, path, json_body
-    return call_args[0][2]
+        results = store.search(
+            ("memories", "user_id", "alice"),
+            limit=3,
+            offset=2,
+        )
+        assert len(results) == 3
+        assert results[0].value["fact"] == "Fact 2"
+
+
+# ── Store: Put ──────────────────────────────────────────────────────────
 
 
 class TestStorePut:
-    def test_put_creates_memory(self) -> None:
-        store = _make_store()
-        with patch.object(store, "_make_request", return_value=_mock_memory()) as mock_req:
-            store.put(
-                ("memories", "user_id", "alice"),
-                "new-mem",
-                {"fact": "Likes hiking"},
-            )
+    def test_put_creates_memory(self, store, mock_memories) -> None:
+        mock_memories.create.return_value = MagicMock()
 
-        mock_req.assert_called_once()
-        assert mock_req.call_args[0][0] == "POST"  # method
-        body = _get_body(mock_req)
-        assert body["scope"] == {"user_id": "alice"}
-        assert body["fact"] == "Likes hiking"
+        store.put(("memories", "user_id", "alice"), "new", {"fact": "Likes hiking"})
 
-    def test_put_with_metadata(self) -> None:
-        store = _make_store()
-        with patch.object(store, "_make_request", return_value=_mock_memory()) as mock_req:
-            store.put(
-                ("memories", "user_id", "alice"),
-                "new-mem",
-                {"fact": "Likes tea", "metadata": {"source": "chat"}},
-            )
+        mock_memories.create.assert_called_once_with(
+            name="projects/test-project/locations/us-central1/reasoningEngines/123456",
+            fact="Likes hiking",
+            scope={"user_id": "alice"},
+        )
 
-        body = _get_body(mock_req)
-        assert body["metadata"] == {"source": "chat"}
+    def test_put_without_fact_serializes_value(self, store, mock_memories) -> None:
+        mock_memories.create.return_value = MagicMock()
 
-    def test_put_without_fact_serializes_value(self) -> None:
-        store = _make_store()
-        with patch.object(store, "_make_request", return_value={}) as mock_req:
-            store.put(
-                ("memories", "user_id", "alice"),
-                "key1",
-                {"name": "Alice", "age": 30},
-            )
+        store.put(("memories", "user_id", "alice"), "k", {"name": "Alice", "age": 30})
 
-        body = _get_body(mock_req)
-        # fact should be JSON-serialized value since no "fact" key
-        parsed = json.loads(body["fact"])
+        call_kwargs = mock_memories.create.call_args.kwargs
+        parsed = json.loads(call_kwargs["fact"])
         assert parsed["name"] == "Alice"
+
+    def test_put_tracks_scope(self, store, mock_memories) -> None:
+        mock_memories.create.return_value = MagicMock()
+
+        store.put(("memories", "user_id", "alice"), "k", {"fact": "test"})
+        assert (("user_id", "alice"),) in store._known_scopes
+
+
+# ── Store: Delete ───────────────────────────────────────────────────────
 
 
 class TestStoreDelete:
-    def test_delete_calls_api(self) -> None:
-        store = _make_store()
-        with patch.object(store, "_make_request", return_value={}) as mock_req:
-            store.delete(("memories", "user_id", "alice"), "mem-to-delete")
+    def test_delete_calls_sdk(self, store, mock_memories) -> None:
+        mock_memories.delete.return_value = MagicMock()
 
-        mock_req.assert_called_once_with("DELETE", "/memories/mem-to-delete")
+        store.delete(("memories", "user_id", "alice"), "mem-to-delete")
 
-    def test_delete_not_found_is_silent(self) -> None:
-        store = _make_store()
-        with patch.object(
-            store, "_make_request", side_effect=RuntimeError("API error 404: Not Found")
-        ):
-            # Should not raise
-            store.delete(("memories", "user_id", "alice"), "nonexistent")
+        mock_memories.delete.assert_called_once_with(
+            name="projects/test-project/locations/us-central1/reasoningEngines/123456/memories/mem-to-delete"
+        )
+
+    def test_delete_not_found_is_silent(self, store, mock_memories) -> None:
+        mock_memories.delete.side_effect = Exception("404 NOT_FOUND")
+        # Should not raise
+        store.delete(("memories", "user_id", "alice"), "nonexistent")
+
+
+# ── Store: List Namespaces ──────────────────────────────────────────────
 
 
 class TestStoreListNamespaces:
-    def test_list_from_known_scopes(self) -> None:
-        store = _make_store()
+    def test_list_from_known_scopes(self, store, mock_memories) -> None:
         store._known_scopes.add((("user_id", "alice"),))
         store._known_scopes.add((("user_id", "bob"),))
+        mock_memories.list.return_value = iter([])
 
-        with patch.object(store, "_make_request", return_value={"memories": []}):
-            result = store.list_namespaces()
-
+        result = store.list_namespaces()
         assert len(result) == 2
         assert ("memories", "user_id", "alice") in result
         assert ("memories", "user_id", "bob") in result
 
-    def test_list_discovers_from_api(self) -> None:
-        store = _make_store()
-        api_response = {
-            "memories": [
-                _mock_memory("m1", scope={"user_id": "carol"}),
-            ]
-        }
-        with patch.object(store, "_make_request", return_value=api_response):
-            result = store.list_namespaces()
+    def test_list_discovers_from_sdk(self, store, mock_memories) -> None:
+        mem = _mock_sdk_memory("m1", scope={"user_id": "carol"})
+        mock_memories.list.return_value = iter([mem])
 
+        result = store.list_namespaces()
         assert ("memories", "user_id", "carol") in result
 
-    def test_list_with_prefix_filter(self) -> None:
-        store = _make_store()
+    def test_list_with_prefix_filter(self, store, mock_memories) -> None:
         store._known_scopes.add((("user_id", "alice"),))
         store._known_scopes.add((("agent_id", "bot1"),))
+        mock_memories.list.return_value = iter([])
 
-        with patch.object(store, "_make_request", return_value={"memories": []}):
-            result = store.list_namespaces(prefix=("memories", "user_id"))
-
-        # Only the user_id namespace should match
+        result = store.list_namespaces(prefix=("memories", "user_id"))
         assert len(result) == 1
         assert ("memories", "user_id", "alice") in result
 
-    def test_list_with_max_depth(self) -> None:
-        store = _make_store()
+    def test_list_with_max_depth(self, store, mock_memories) -> None:
         store._known_scopes.add((("agent", "bot1"), ("user_id", "alice")))
+        mock_memories.list.return_value = iter([])
 
-        with patch.object(store, "_make_request", return_value={"memories": []}):
-            result = store.list_namespaces(max_depth=2)
-
-        # Namespace ("memories", "agent", "bot1", "user_id", "alice") truncated to depth 2
+        result = store.list_namespaces(max_depth=2)
         assert all(len(ns) <= 2 for ns in result)
 
 
-# ── Generate memories tests ─────────────────────────────────────────────
+# ── Generate Memories ───────────────────────────────────────────────────
 
 
 class TestGenerateMemories:
-    def test_generate_memories_sync(self) -> None:
-        store = _make_store()
-        api_response = {
-            "done": True,
-            "response": {
-                "generatedMemories": [
-                    {"memory": _mock_memory("g1", "Lives in Portland"), "action": "CREATED"},
-                    {"memory": _mock_memory("g2", "Likes hiking"), "action": "CREATED"},
-                ]
-            },
-        }
+    def test_generate_calls_sdk(self, store, mock_memories) -> None:
+        mock_op = MagicMock()
+        mock_memories.generate.return_value = mock_op
+
         events = [
-            {"content": {"role": "user", "parts": [{"text": "I live in Portland and love hiking"}]}},
+            {"content": {"role": "user", "parts": [{"text": "I love hiking"}]}},
         ]
+        result = store.generate_memories(scope={"user_id": "alice"}, events=events)
 
-        with patch.object(store, "_make_request", return_value=api_response) as mock_req:
-            results = store.generate_memories(
-                scope={"user_id": "alice"},
-                events=events,
-            )
+        assert result is mock_op
+        call_kwargs = mock_memories.generate.call_args.kwargs
+        assert call_kwargs["scope"] == {"user_id": "alice"}
+        assert call_kwargs["direct_contents_source"]["events"] == events
 
-        assert len(results) == 2
-        assert results[0]["action"] == "CREATED"
+    def test_generate_with_topics(self) -> None:
+        mock_memories, s = _make_store(topics=["default_topic"])
+        mock_memories.generate.return_value = MagicMock()
 
-        # Verify API call
-        mock_req.assert_called_once()
-        body = _get_body(mock_req)
-        assert body["scope"] == {"user_id": "alice"}
-        assert "directContentsSource" in body
+        s.generate_memories(
+            scope={"user_id": "alice"},
+            events=[{"content": {"role": "user", "parts": [{"text": "test"}]}}],
+            topics=["preferences", "facts"],
+        )
 
-    def test_generate_memories_background(self) -> None:
-        store = _make_store()
-        api_response = {
-            "name": "projects/p/locations/l/operations/op1",
-            "done": False,
-        }
-        events = [
-            {"content": {"role": "user", "parts": [{"text": "Hello"}]}},
-        ]
+        call_kwargs = mock_memories.generate.call_args.kwargs
+        config = call_kwargs["config"]
+        assert len(config["memory_topics"]) == 2
+        labels = [t["custom_memory_topic"]["label"] for t in config["memory_topics"]]
+        assert "preferences" in labels
+        assert "facts" in labels
 
-        with patch.object(store, "_make_request", return_value=api_response):
-            results = store.generate_memories(
-                scope={"user_id": "alice"},
-                events=events,
-                wait_for_completion=False,
-            )
+    def test_generate_with_constructor_topics(self) -> None:
+        mock_memories, s = _make_store(topics=["my_topic"])
+        mock_memories.generate.return_value = MagicMock()
 
-        # Should return operation info
-        assert len(results) == 1
-        assert "operation" in results[0]
+        s.generate_memories(
+            scope={"user_id": "alice"},
+            events=[{"content": {"role": "user", "parts": [{"text": "test"}]}}],
+        )
 
-    def test_generate_with_disable_consolidation(self) -> None:
-        store = _make_store()
-        with patch.object(store, "_make_request", return_value={"done": True, "response": {"generatedMemories": []}}) as mock_req:
-            store.generate_memories(
-                scope={"user_id": "alice"},
-                events=[{"content": {"role": "user", "parts": [{"text": "test"}]}}],
-                disable_consolidation=True,
-            )
+        call_kwargs = mock_memories.generate.call_args.kwargs
+        assert call_kwargs["config"]["memory_topics"][0]["custom_memory_topic"]["label"] == "my_topic"
 
-        body = _get_body(mock_req)
-        assert body["disableConsolidation"] is True
+    def test_generate_with_consolidation_disabled(self) -> None:
+        mock_memories, s = _make_store(disable_consolidation=True)
+        mock_memories.generate.return_value = MagicMock()
+
+        s.generate_memories(
+            scope={"user_id": "alice"},
+            events=[{"content": {"role": "user", "parts": [{"text": "test"}]}}],
+        )
+
+        call_kwargs = mock_memories.generate.call_args.kwargs
+        assert call_kwargs["config"]["disable_consolidation"] is True
+
+    def test_generate_with_revision_labels(self) -> None:
+        mock_memories, s = _make_store(revision_labels={"source": "langgraph"})
+        mock_memories.generate.return_value = MagicMock()
+
+        s.generate_memories(
+            scope={"user_id": "alice"},
+            events=[{"content": {"role": "user", "parts": [{"text": "test"}]}}],
+        )
+
+        call_kwargs = mock_memories.generate.call_args.kwargs
+        assert call_kwargs["config"]["revision_labels"] == {"source": "langgraph"}
+
+    def test_generate_per_call_revision_labels_override(self) -> None:
+        mock_memories, s = _make_store(revision_labels={"source": "default"})
+        mock_memories.generate.return_value = MagicMock()
+
+        s.generate_memories(
+            scope={"user_id": "alice"},
+            events=[{"content": {"role": "user", "parts": [{"text": "test"}]}}],
+            revision_labels={"source": "override"},
+        )
+
+        call_kwargs = mock_memories.generate.call_args.kwargs
+        assert call_kwargs["config"]["revision_labels"] == {"source": "override"}
+
+    def test_generate_no_config_when_defaults(self, store, mock_memories) -> None:
+        mock_memories.generate.return_value = MagicMock()
+
+        store.generate_memories(
+            scope={"user_id": "alice"},
+            events=[{"content": {"role": "user", "parts": [{"text": "test"}]}}],
+        )
+
+        call_kwargs = mock_memories.generate.call_args.kwargs
+        assert "config" not in call_kwargs
+
+    def test_generate_tracks_scope(self, store, mock_memories) -> None:
+        mock_memories.generate.return_value = MagicMock()
+
+        store.generate_memories(
+            scope={"user_id": "alice"},
+            events=[{"content": {"role": "user", "parts": [{"text": "test"}]}}],
+        )
+        assert (("user_id", "alice"),) in store._known_scopes
 
 
-# ── Utility method tests ────────────────────────────────────────────────
+# ── Utilities ───────────────────────────────────────────────────────────
 
 
 class TestUtilities:
-    def test_scope_for_namespace(self) -> None:
-        store = _make_store()
-        ns = ("memories", "user_id", "alice", "session", "s1")
-        scope = store.scope_for_namespace(ns)
+    def test_scope_for_namespace(self, store) -> None:
+        scope = store.scope_for_namespace(("memories", "user_id", "alice", "session", "s1"))
         assert scope == {"user_id": "alice", "session": "s1"}
 
-    def test_namespace_for_scope(self) -> None:
-        store = _make_store()
-        scope = {"user_id": "bob"}
-        ns = store.namespace_for_scope(scope)
+    def test_scope_for_namespace_with_topic(self, store) -> None:
+        scope = store.scope_for_namespace(
+            ("memories", "user_id", "alice", "topic", "preferences")
+        )
+        assert scope == {"user_id": "alice"}
+
+    def test_namespace_for_scope(self, store) -> None:
+        ns = store.namespace_for_scope({"user_id": "bob"})
         assert ns == ("memories", "user_id", "bob")
 
+    def test_namespace_for_scope_with_topic(self, store) -> None:
+        ns = store.namespace_for_scope({"user_id": "bob"}, topic="prefs")
+        assert ns == ("memories", "user_id", "bob", "topic", "prefs")
 
-# ── Auth tests ──────────────────────────────────────────────────────────
+
+# ── Constructor config ──────────────────────────────────────────────────
 
 
-class TestAuth:
-    def test_get_headers_refreshes_expired_credentials(self) -> None:
-        mock_creds = MagicMock()
-        mock_creds.valid = False
-        mock_creds.token = "refreshed-token"
+class TestConstructorConfig:
+    def test_defaults(self, store) -> None:
+        assert store.default_top_k == 10
+        assert store.min_similarity_score == 0.3
+        assert store.revision_labels is None
+        assert store.topics is None
+        assert store.disable_consolidation is False
+
+    def test_custom_config(self) -> None:
+        _, s = _make_store(
+            default_top_k=20,
+            min_similarity_score=0.5,
+            revision_labels={"env": "prod"},
+            topics=["prefs", "facts"],
+            disable_consolidation=True,
+        )
+        assert s.default_top_k == 20
+        assert s.min_similarity_score == 0.5
+        assert s.revision_labels == {"env": "prod"}
+        assert s.topics == ["prefs", "facts"]
+        assert s.disable_consolidation is True
+
+    def test_engine_name_format(self, store) -> None:
+        assert store._engine_name == (
+            "projects/test-project/locations/us-central1/reasoningEngines/123456"
+        )
+
+    def test_uses_provided_client(self) -> None:
+        mock_client = MagicMock()
+        store = VertexMemoryBankStore(
+            project_id="p", location="l", reasoning_engine_id="e",
+            client=mock_client,
+        )
+        assert store._client is mock_client
+
+    @patch("langgraph_vertex_memorybank.store.vertexai.Client")
+    def test_creates_client_from_params(self, mock_client_cls: MagicMock) -> None:
+        mock_instance = MagicMock()
+        mock_client_cls.return_value = mock_instance
 
         store = VertexMemoryBankStore(
-            project_id="p",
-            location="l",
-            reasoning_engine_id="e",
-            credentials=mock_creds,
+            project_id="my-proj", location="eu-west1", reasoning_engine_id="789",
         )
-        headers = store._get_headers()
-        mock_creds.refresh.assert_called_once()
-        assert headers["Authorization"] == "Bearer refreshed-token"
 
-    def test_get_headers_skips_refresh_when_valid(self) -> None:
-        mock_creds = MagicMock()
-        mock_creds.valid = True
-        mock_creds.token = "valid-token"
-
-        store = VertexMemoryBankStore(
-            project_id="p",
-            location="l",
-            reasoning_engine_id="e",
-            credentials=mock_creds,
-        )
-        headers = store._get_headers()
-        mock_creds.refresh.assert_not_called()
-        assert headers["Authorization"] == "Bearer valid-token"
+        mock_client_cls.assert_called_once_with(project="my-proj", location="eu-west1")
+        assert store._client is mock_instance
 
 
-# ── URL construction tests ──────────────────────────────────────────────
+# ── Alias ───────────────────────────────────────────────────────────────
 
 
-class TestURLConstruction:
-    def test_base_url(self) -> None:
-        store = _make_store()
-        assert "test-project" in store._base_url
-        assert "us-central1" in store._base_url
-        assert "123456" in store._base_url
-        assert store._base_url.startswith("https://")
-
-    def test_different_location(self) -> None:
-        mock_creds = MagicMock()
-        mock_creds.valid = True
-        store = VertexMemoryBankStore(
-            project_id="proj",
-            location="europe-west1",
-            reasoning_engine_id="789",
-            credentials=mock_creds,
-        )
-        assert "europe-west1-aiplatform.googleapis.com" in store._base_url
+class TestAlias:
+    def test_alias_is_same_class(self) -> None:
+        from langgraph_vertex_memorybank import LangGraphVertexAIMemoryBank
+        assert LangGraphVertexAIMemoryBank is VertexMemoryBankStore

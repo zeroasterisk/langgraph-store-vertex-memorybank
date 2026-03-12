@@ -15,9 +15,8 @@ import uuid
 
 import pytest
 
-from langgraph_store_vertex_memorybank import VertexMemoryBankStore
+from langgraph_vertex_memorybank import VertexMemoryBankStore
 
-# Skip all tests in this module unless explicitly running integration tests
 pytestmark = pytest.mark.integration
 
 PROJECT_ID = os.environ.get("GCP_PROJECT_ID", "zaf-sandbox")
@@ -53,8 +52,6 @@ class TestIntegrationSearch:
         """Search against the existing alan scope (has real memories)."""
         ns = ("memories", "user_id", "alan")
         results = store.search(ns, query="What does the user work on?", limit=3)
-        # alan scope has memories from real usage
-        # This may return results if the scope has data
         assert isinstance(results, list)
         for r in results:
             assert hasattr(r, "value")
@@ -102,14 +99,13 @@ class TestIntegrationGenerateMemories:
             },
         ]
 
-        results = store.generate_memories(
+        op = store.generate_memories(
             scope=test_scope,
             events=events,
-            wait_for_completion=True,
         )
 
-        # Should have extracted some memories
-        assert len(results) > 0
+        # The SDK returns an operation object
+        assert op is not None
 
         # Verify memories are searchable
         ns = store.namespace_for_scope(test_scope)
