@@ -54,6 +54,9 @@ sample = [
 [project.urls]
 Homepage = "https://github.com/zeroasterisk/langgraph-store-vertex-memorybank"
 Repository = "https://github.com/zeroasterisk/langgraph-store-vertex-memorybank"
+Documentation = "https://cloud.google.com/vertex-ai/generative-ai/docs/agent-engine/memory-bank/overview"
+Issues = "https://github.com/zeroasterisk/langgraph-store-vertex-memorybank/issues"
+Changelog = "https://github.com/zeroasterisk/langgraph-store-vertex-memorybank/releases"
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/langgraph_store_vertex_memorybank"]
