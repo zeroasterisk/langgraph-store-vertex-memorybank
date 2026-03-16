@@ -499,3 +499,66 @@ class VertexMemoryBankStore(BaseStore):
     ) -> tuple[str, ...]:
         """Convert a scope dict to a namespace tuple."""
         return _scope_to_namespace(scope, self.namespace_prefix, topic)
+
+    def generate_memories(
+        self,
+        conversation: list[dict[str, Any]],
+        namespace: tuple[str, ...],
+        model_name: str = "claude-3-haiku-20240307",
+    ) -> None:
+        """Extract facts from a conversation and save them to the memory bank.
+
+        Args:
+            conversation: A list of messages in the conversation.
+            namespace: The namespace to save the memories to.
+            model_name: The Anthropic model to use for fact extraction.
+        """
+        try:
+            import anthropic
+        except ImportError:
+            raise ImportError(
+                "Anthropic SDK not found. Please install it with `pip install anthropic`."
+            )
+
+        client = anthropic.Anthropic()
+        scope, _ = _parse_namespace(namespace)
+
+        prompt = (
+            "You are a memory extraction agent. Your task is to extract key facts from the "
+            "conversation and represent them as concise, self-contained statements. "
+            "Format the output as a JSON list of strings.\n\n"
+            f"Conversation:\n{json.dumps(conversation, indent=2)}\n\n"
+            "Extracted facts:"
+        )
+
+        try:
+            response = client.messages.create(
+                model=model_name,
+                max_tokens=1024,
+                messages=[{"role": "user", "content": prompt}],
+            )
+            facts_text = response.content[0].text
+            facts = json.loads(facts_text)
+            for fact in facts:
+                self._memories.create(name=self._engine_name, fact=fact, scope=scope)
+        except Exception as e:
+            logger.error(f"Failed to generate memories: {e}")
+
+
+def create_capture_node(store: VertexMemoryBankStore, namespace: tuple[str, ...]):
+    """Create a LangGraph node that captures memories from the conversation.
+
+    Args:
+        store: The VertexMemoryBankStore instance.
+        namespace: The namespace to save the memories to.
+
+    Returns:
+        A LangGraph node.
+    """
+
+    def capture_node(state: dict) -> dict:
+        if "messages" in state:
+            store.generate_memories(state["messages"], namespace)
+        return {}
+
+    return capture_node

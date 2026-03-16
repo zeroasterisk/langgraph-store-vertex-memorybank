@@ -471,3 +471,40 @@ class TestFilterNamespaces:
         ns_list = [("a", "b", "c"), ("x", "b", "d")]
         result = _filter_namespaces(ns_list, (MatchCondition(match_type="prefix", path=("*", "b")),))
         assert len(result) == 2
+
+
+class TestGenerateMemories:
+    @patch("anthropic.Anthropic")
+    def test_generate_memories(self, mock_anthropic, store, mock_memories):
+        mock_client = MagicMock()
+        mock_anthropic.return_value = mock_client
+        mock_response = MagicMock()
+        mock_response.content[0].text = '["fact 1", "fact 2"]'
+        mock_client.messages.create.return_value = mock_response
+
+        conversation = [{"role": "user", "content": "Hello"}, {"role": "assistant", "content": "Hi"}]
+        namespace = ("memories", "user_id", "alice")
+        store.generate_memories(conversation, namespace)
+
+        mock_client.messages.create.assert_called_once()
+        assert mock_memories.create.call_count == 2
+        mock_memories.create.assert_any_call(
+            name=store._engine_name, fact="fact 1", scope={"user_id": "alice"}
+        )
+        mock_memories.create.assert_any_call(
+            name=store._engine_name, fact="fact 2", scope={"user_id": "alice"}
+        )
+
+
+class TestCreateCaptureNode:
+    def test_create_capture_node(self, store):
+        from langgraph_store_vertex_memorybank.store import create_capture_node
+
+        namespace = ("memories", "user_id", "alice")
+        capture_node = create_capture_node(store, namespace)
+        assert callable(capture_node)
+
+        with patch.object(store, "generate_memories") as mock_generate_memories:
+            state = {"messages": [{"role": "user", "content": "Hello"}]}
+            capture_node(state)
+            mock_generate_memories.assert_called_once_with(state["messages"], namespace)
