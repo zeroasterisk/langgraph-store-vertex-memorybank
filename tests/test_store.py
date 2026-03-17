@@ -8,9 +8,10 @@ from __future__ import annotations
 import json
 from datetime import datetime, timezone
 from typing import Any
-from unittest.mock import AsyncMock, MagicMock, patch
+from unittest.mock import MagicMock, patch
 
 import pytest
+from langgraph.store.base import MatchCondition
 
 from langgraph_store_vertex_memorybank.store import (
     VertexMemoryBankStore,
@@ -22,8 +23,6 @@ from langgraph_store_vertex_memorybank.store import (
     _sdk_memory_to_item,
     _sdk_retrieved_to_search_item,
 )
-from langgraph.store.base import MatchCondition
-
 
 # ── Helpers ─────────────────────────────────────────────────────────────
 
@@ -378,7 +377,7 @@ class TestBatch:
         mock_memories.retrieve.return_value = [_mock_sdk_retrieved("m2", "Found")]
         mock_memories.list.return_value = iter([])
 
-        from langgraph.store.base import GetOp, SearchOp, PutOp
+        from langgraph.store.base import GetOp, PutOp, SearchOp
 
         results = store.batch([
             GetOp(namespace=("memories", "user_id", "alice"), key="m1"),

@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "langgraph-store-vertex-memorybank"
-version = "0.3.0"
+version = "0.4.0"
 description = "LangGraph BaseStore backed by Vertex AI Agent Engine Memory Bank — fully managed, LLM-powered long-term memory."
 readme = "README.md"
 license = "Apache-2.0"
@@ -36,6 +36,7 @@ classifiers = [
 ]
 dependencies = [
     "google-cloud-aiplatform>=1.111.0",
+    "langchain-core>=0.3.0",
     "langgraph>=0.3.0",
 ]
 

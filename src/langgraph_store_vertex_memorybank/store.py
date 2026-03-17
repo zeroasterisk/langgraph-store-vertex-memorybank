@@ -487,6 +487,76 @@ class VertexMemoryBankStore(BaseStore):
         result.sort()
         return result[op.offset : op.offset + op.limit]
 
+    # ── Memory Generation (extension, not part of BaseStore) ───────────
+
+    def generate_memories(
+        self,
+        scope: dict[str, str],
+        events: list[dict[str, Any]],
+        *,
+        wait_for_completion: bool = True,
+    ) -> Any:
+        """Generate memories from conversation events using Memory Bank's LLM extraction.
+
+        This is Memory Bank's killer feature: an LLM extracts meaningful facts
+        from conversation turns and consolidates them with existing memories —
+        deduplicating, updating, and deleting contradicted information
+        automatically.
+
+        Unlike ``BaseStore.put()`` (which stores exactly what you give it),
+        ``generate_memories()`` uses an LLM to decide what's worth remembering.
+
+        Not part of the ``BaseStore`` interface — this is a Memory Bank–specific
+        extension. Use it directly or via :func:`create_capture_node`.
+
+        Args:
+            scope: Memory isolation scope, e.g. ``{"user_id": "alice"}``.
+            events: Conversation events in Vertex AI format::
+
+                [{"content": {"role": "user", "parts": [{"text": "I live in Portland"}]}},
+                 {"content": {"role": "model", "parts": [{"text": "Nice city!"}]}}]
+
+            wait_for_completion: If True, wait for the LRO to complete.
+
+        Returns:
+            The operation result from the SDK. Access generated memories via
+            the response object.
+
+        Example::
+
+            events = [
+                {"content": {"role": "user", "parts": [{"text": "I love hiking"}]}},
+                {"content": {"role": "model", "parts": [{"text": "Great hobby!"}]}},
+            ]
+            result = store.generate_memories(
+                scope={"user_id": "alice"},
+                events=events,
+            )
+        """
+        self._known_scopes.add(tuple(sorted(scope.items())))
+        return self._memories.generate(
+            name=self._engine_name,
+            direct_contents_source={"events": events},
+            scope=scope,
+            config={"wait_for_completion": wait_for_completion},
+        )
+
+    async def agenerate_memories(
+        self,
+        scope: dict[str, str],
+        events: list[dict[str, Any]],
+        *,
+        wait_for_completion: bool = True,
+    ) -> Any:
+        """Async version of :meth:`generate_memories`."""
+        self._known_scopes.add(tuple(sorted(scope.items())))
+        return await self._amemories.generate(
+            name=self._engine_name,
+            direct_contents_source={"events": events},
+            scope=scope,
+            config={"wait_for_completion": wait_for_completion},
+        )
+
     # ── Utilities ───────────────────────────────────────────────────────
 
     def scope_for_namespace(self, namespace: tuple[str, ...]) -> dict[str, str]:

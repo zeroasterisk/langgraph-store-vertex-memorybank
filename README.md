@@ -16,9 +16,20 @@ pip install langgraph-store-vertex-memorybank
 | `AsyncPostgresStore` | ✅ | ❌ You run it | ❌ |
 | **`VertexMemoryBankStore`** | ✅ | ✅ Google Cloud | ✅ Extracts, consolidates, deduplicates |
 
+## Two Memory Patterns
+
+This package supports two complementary patterns for managing long-term memory:
+
+| Pattern | How it works | Best for |
+|---|---|---|
+| **A: langmem tools** | Agent decides what to store via `create_manage_memory_tool` | Explicit, agent-driven memory |
+| **B: GenerateMemories + nodes** | Memory Bank's LLM extracts facts automatically after each conversation | Automatic, implicit, smarter extraction |
+
+**They're complementary.** Use langmem tools when the agent should decide (e.g., "remember this"). Use GenerateMemories when you want automatic extraction without the agent needing to think about memory.
+
 ## Quick Start
 
-### With langmem (recommended)
+### Pattern A: langmem tools (agent-driven)
 
 ```python
 from langgraph.prebuilt import create_react_agent
@@ -38,6 +49,49 @@ agent = create_react_agent(
         create_search_memory_tool(namespace=("memories",)),
     ],
     store=store,
+)
+```
+
+### Pattern B: GenerateMemories + nodes (automatic)
+
+```python
+from langgraph.graph import StateGraph, START, END
+from langgraph.prebuilt import create_react_agent
+from langgraph.graph import MessagesState
+from langgraph_store_vertex_memorybank import (
+    VertexMemoryBankStore,
+    create_recall_node,
+    create_capture_node,
+)
+
+store = VertexMemoryBankStore(
+    project_id="my-project",
+    location="us-central1",
+    reasoning_engine_id="123456",
+)
+
+# Recall injects relevant memories as a SystemMessage before the agent responds.
+# Capture runs generate_memories() in a background thread after the agent responds.
+recall = create_recall_node(store, recall_mode="system", top_k=5)
+capture = create_capture_node(store, fire_and_forget=True)
+
+def agent(state):
+    # your agent logic here
+    ...
+
+builder = StateGraph(MessagesState)
+builder.add_node("recall", recall)
+builder.add_node("agent", agent)
+builder.add_node("capture", capture)
+builder.add_edge(START, "recall")
+builder.add_edge("recall", "agent")
+builder.add_edge("agent", "capture")
+builder.add_edge("capture", END)
+
+graph = builder.compile()
+graph.invoke(
+    {"messages": [("user", "I just moved to Portland")]},
+    {"configurable": {"user_id": "alice"}},
 )
 ```
 
@@ -61,18 +115,43 @@ for r in results:
     print(f"[{r.score:.2f}] {r.value['fact']}")
 ```
 
+## Memory Generation
+
+`generate_memories()` is Memory Bank's killer feature. Unlike `put()` (which stores exactly what you give it), `generate_memories()` uses an LLM to:
+
+- **Extract** meaningful facts from conversation turns
+- **Consolidate** with existing memories — deduplicating and updating
+- **Delete** contradicted information automatically
+
+```python
+# Direct usage
+events = [
+    {"content": {"role": "user", "parts": [{"text": "I just moved to Portland from NYC"}]}},
+    {"content": {"role": "model", "parts": [{"text": "Welcome to Portland!"}]}},
+]
+store.generate_memories(scope={"user_id": "alice"}, events=events)
+```
+
+The `create_capture_node()` helper wraps this into a LangGraph node that automatically converts messages and runs generation in a background thread (fire-and-forget) so it doesn't block the response.
+
+The `create_recall_node()` helper searches memories using the last user message and injects them as a `SystemMessage` (or state field) before the agent responds.
+
 ## Architecture
 
 ```
-langmem tools          ← create_manage_memory_tool / create_search_memory_tool
-    ↕
-LangGraph BaseStore    ← batch([GetOp, SearchOp, PutOp, ...])
-    ↕
-VertexMemoryBankStore  ← this package (501 lines)
-    ↕
-google-cloud-aiplatform SDK  ← handles auth, retries, pagination
-    ↕
-Vertex AI Memory Bank  ← managed service
+┌─ Pattern A ──────────────────────┐  ┌─ Pattern B ───────────────────────┐
+│ langmem tools                    │  │ recall_node → agent → capture_node│
+│ (agent decides what to store)    │  │ (automatic LLM extraction)        │
+└──────────────┬───────────────────┘  └──────────────┬────────────────────┘
+               ↓                                     ↓
+        LangGraph BaseStore                  generate_memories()
+        batch([GetOp, SearchOp, ...])        (Memory Bank extension)
+               ↓                                     ↓
+         VertexMemoryBankStore  ←── this package ──────┘
+               ↓
+    google-cloud-aiplatform SDK  ← handles auth, retries, pagination
+               ↓
+      Vertex AI Memory Bank  ← managed service
 ```
 
 ## Namespace ↔ Scope Mapping
@@ -107,6 +186,7 @@ Implements the full [LangGraph BaseStore](https://langchain-ai.github.io/langgra
 | `put(ns, key, None)` | `memories.delete(name)` |
 | `list_namespaces()` | `memories.list()` → extract unique scopes |
 | `batch(ops)` / `abatch(ops)` | Dispatches to above |
+| `generate_memories(scope, events)` | `memories.generate(...)` *(extension)* |
 
 Distance is converted to similarity: `score = 1 / (1 + distance)`.
 
