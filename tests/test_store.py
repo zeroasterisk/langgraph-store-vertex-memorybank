@@ -350,7 +350,18 @@ class TestStoreListNamespaces:
         assert len(result) == 2
 
     def test_list_discovers_from_sdk(self, store, mock_memories) -> None:
+        # memories.list() is deprecated — list_namespaces now relies on _known_scopes only.
+        # A scope only appears if it was previously used via search/put.
+        # Verify that the old list() mock has no effect and scopes don't magically appear.
         mock_memories.list.return_value = iter([_mock_sdk_memory("m1", scope={"user_id": "carol"})])
+        result = store.list_namespaces()
+        # carol was never added to _known_scopes, so she should NOT appear
+        assert ("memories", "user_id", "carol") not in result
+        assert len(result) == 0
+
+    def test_list_discovers_via_known_scopes(self, store, mock_memories) -> None:
+        # The new way: scopes are tracked in _known_scopes after search/put
+        store._known_scopes.add((("user_id", "carol"),))
         result = store.list_namespaces()
         assert ("memories", "user_id", "carol") in result
 

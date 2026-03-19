@@ -361,18 +361,13 @@ class VertexMemoryBankStore(BaseStore):
         self._memories.create(name=self._engine_name, fact=fact, scope=scope)
 
     def _handle_list_namespaces(self, op: ListNamespacesOp) -> list[tuple[str, ...]]:
+        # NOTE: We rely on _known_scopes (populated via search/put ops) rather than
+        # calling memories.list(), which is being deprecated in favour of retrieve()
+        # (retrieve() requires an explicit scope, so bulk scanning isn't possible).
+        # Track scopes proactively in _handle_search / _handle_put instead.
         namespaces: set[tuple[str, ...]] = set()
         for scope_items in self._known_scopes:
             namespaces.add(_scope_to_namespace(dict(scope_items), self.namespace_prefix))
-
-        try:
-            for mem in self._memories.list(name=self._engine_name):
-                scope = dict(mem.scope) if mem.scope else {}
-                if scope:
-                    namespaces.add(_scope_to_namespace(scope, self.namespace_prefix))
-                    self._known_scopes.add(tuple(sorted(scope.items())))
-        except Exception:
-            logger.debug("Could not list memories for namespace discovery")
 
         result = list(namespaces)
         if op.match_conditions:
@@ -465,19 +460,11 @@ class VertexMemoryBankStore(BaseStore):
         await self._amemories.create(name=self._engine_name, fact=fact, scope=scope)
 
     async def _ahandle_list_namespaces(self, op: ListNamespacesOp) -> list[tuple[str, ...]]:
+        # NOTE: mirrors _handle_list_namespaces — relies on _known_scopes only.
+        # memories.list() is being deprecated; retrieve() requires explicit scope.
         namespaces: set[tuple[str, ...]] = set()
         for scope_items in self._known_scopes:
             namespaces.add(_scope_to_namespace(dict(scope_items), self.namespace_prefix))
-
-        try:
-            pager = await self._amemories.list(name=self._engine_name)
-            async for mem in pager:
-                scope = dict(mem.scope) if mem.scope else {}
-                if scope:
-                    namespaces.add(_scope_to_namespace(scope, self.namespace_prefix))
-                    self._known_scopes.add(tuple(sorted(scope.items())))
-        except Exception:
-            logger.debug("Could not list memories for namespace discovery")
 
         result = list(namespaces)
         if op.match_conditions:
