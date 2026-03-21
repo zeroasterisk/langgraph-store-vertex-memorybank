@@ -518,3 +518,55 @@ class TestCreateCaptureNode:
             state = {"messages": [{"role": "user", "content": "Hello"}]}
             capture_node(state)
             mock_generate_memories.assert_called_once_with(state["messages"], namespace)
+
+def test_put_ttl():
+    from langgraph.store.base import PutOp
+    mock_client = MagicMock()
+    # No default ttl mapping
+    store = VertexMemoryBankStore("project", "location", "engine", mock_client)
+    
+    op = PutOp(namespace=("memories", "user_id", "123"), key="key1", value={"fact": "foo"}, ttl=3600)
+    store.batch([op])
+    
+    mock_client.agent_engines.memories.create.assert_called_once()
+    kwargs = mock_client.agent_engines.memories.create.call_args.kwargs
+    assert kwargs["config"]["ttl"] == "3600s"
+
+def test_namespace_ttl():
+    from langgraph.store.base import PutOp
+    mock_client = MagicMock()
+    # With namespace ttl mapping
+    store = VertexMemoryBankStore(
+        "project", "location", "engine", mock_client,
+        namespace_ttl={("memories", "user_id"): 86400, ("memories", "user_id", "VIP"): 99999}
+    )
+    
+    # Matches ("memories", "user_id")
+    op1 = PutOp(namespace=("memories", "user_id", "123", "topic", "x"), key="key1", value={"fact": "foo"})
+    # Matches ("memories", "user_id", "VIP") -> longer prefix
+    op2 = PutOp(namespace=("memories", "user_id", "VIP", "topic", "x"), key="key2", value={"fact": "bar"})
+    # Overridden by op.ttl
+    op3 = PutOp(namespace=("memories", "user_id", "123"), key="key3", value={"fact": "baz"}, ttl=123)
+    
+    store.batch([op1, op2, op3])
+    
+    calls = mock_client.agent_engines.memories.create.call_args_list
+    assert len(calls) == 3
+    assert calls[0].kwargs["config"]["ttl"] == "86400s"
+    assert calls[1].kwargs["config"]["ttl"] == "99999s"
+    assert calls[2].kwargs["config"]["ttl"] == "123s"
+
+
+
+def test_aput_ttl():
+    import asyncio
+    from langgraph.store.base import PutOp
+    mock_client = AsyncMock()
+    store = VertexMemoryBankStore("project", "location", "engine", mock_client, namespace_ttl={("memories",): 100})
+    
+    op = PutOp(namespace=("memories", "user_id", "abc"), key="key1", value={"fact": "foo"})
+    asyncio.run(store.abatch([op]))
+    
+    mock_client.aio.agent_engines.memories.create.assert_called_once()
+    kwargs = mock_client.aio.agent_engines.memories.create.call_args.kwargs
+    assert kwargs["config"]["ttl"] == "100s"

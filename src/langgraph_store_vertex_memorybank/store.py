@@ -211,6 +211,7 @@ class VertexMemoryBankStore(BaseStore):
         namespace_prefix: Prefix for namespace tuples (default ``"memories"``).
         default_top_k: Default result count for search (default 10).
         min_similarity_score: Floor for search results (default 0.3).
+        namespace_ttl: Optional mapping of namespace prefixes to TTL in seconds.
     """
 
     def __init__(
@@ -222,6 +223,7 @@ class VertexMemoryBankStore(BaseStore):
         namespace_prefix: str = "memories",
         default_top_k: int = 10,
         min_similarity_score: float = 0.3,
+        namespace_ttl: dict[tuple[str, ...], float] | None = None,
     ) -> None:
         self.project_id = project_id
         self.location = location
@@ -229,6 +231,7 @@ class VertexMemoryBankStore(BaseStore):
         self.namespace_prefix = namespace_prefix
         self.default_top_k = default_top_k
         self.min_similarity_score = min_similarity_score
+        self.namespace_ttl = namespace_ttl or {}
 
         self._client = client or vertexai.Client(project=project_id, location=location)
         self._known_scopes: set[tuple[tuple[str, str], ...]] = set()
@@ -358,7 +361,12 @@ class VertexMemoryBankStore(BaseStore):
         if not fact:
             fact = json.dumps(op.value)
 
-        self._memories.create(name=self._engine_name, fact=fact, scope=scope)
+        ttl = self._get_ttl(op.namespace, getattr(op, "ttl", None))
+        kwargs = {"name": self._engine_name, "fact": fact, "scope": scope}
+        if ttl is not None:
+            kwargs["config"] = {"ttl": ttl}
+
+        self._memories.create(**kwargs)
 
     def _handle_list_namespaces(self, op: ListNamespacesOp) -> list[tuple[str, ...]]:
         # NOTE: We rely on _known_scopes (populated via search/put ops) rather than
@@ -457,7 +465,12 @@ class VertexMemoryBankStore(BaseStore):
         if not fact:
             fact = json.dumps(op.value)
 
-        await self._amemories.create(name=self._engine_name, fact=fact, scope=scope)
+        ttl = self._get_ttl(op.namespace, getattr(op, "ttl", None))
+        kwargs = {"name": self._engine_name, "fact": fact, "scope": scope}
+        if ttl is not None:
+            kwargs["config"] = {"ttl": ttl}
+
+        await self._amemories.create(**kwargs)
 
     async def _ahandle_list_namespaces(self, op: ListNamespacesOp) -> list[tuple[str, ...]]:
         # NOTE: mirrors _handle_list_namespaces — relies on _known_scopes only.
@@ -545,6 +558,24 @@ class VertexMemoryBankStore(BaseStore):
         )
 
     # ── Utilities ───────────────────────────────────────────────────────
+
+    def _get_ttl(self, namespace: tuple[str, ...], put_ttl: float | None) -> str | None:
+        if put_ttl is not None:
+            return f"{int(put_ttl)}s"
+        
+        if self.namespace_ttl:
+            best_match_len = -1
+            best_ttl = None
+            for prefix, ttl in self.namespace_ttl.items():
+                if len(namespace) >= len(prefix) and namespace[:len(prefix)] == prefix:
+                    if len(prefix) > best_match_len:
+                        best_match_len = len(prefix)
+                        best_ttl = ttl
+            
+            if best_ttl is not None:
+                return f"{int(best_ttl)}s"
+        
+        return None
 
     def scope_for_namespace(self, namespace: tuple[str, ...]) -> dict[str, str]:
         """Convert a namespace to a scope dict."""
