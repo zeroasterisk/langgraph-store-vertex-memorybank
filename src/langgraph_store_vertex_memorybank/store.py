@@ -251,36 +251,162 @@ class VertexMemoryBankStore(BaseStore):
     # ── BaseStore interface ─────────────────────────────────────────────
 
     def batch(self, ops: Iterable[Op]) -> list[Result]:
-        results: list[Result] = []
-        for op in ops:
+        """Process multiple operations, batching PutOps by namespace for efficiency."""
+        ops_list = list(ops)
+        results: list[Result | None] = [None] * len(ops_list)
+        
+        # maintain order of operations
+        i = 0
+        while i < len(ops_list):
+            op = ops_list[i]
+            # Batch consecutive PutOps to the same namespace (memories only, no keys/deletes)
+            if isinstance(op, PutOp) and op.value is not None and op.key is None:
+                batch_start = i
+                namespace = op.namespace
+                batch_ops = [op]
+                
+                j = i + 1
+                while (
+                    j < len(ops_list) 
+                    and isinstance(ops_list[j], PutOp) 
+                    and ops_list[j].value is not None 
+                    and ops_list[j].key is None
+                    and ops_list[j].namespace == namespace
+                ):
+                    batch_ops.append(ops_list[j])
+                    j += 1
+                
+                if len(batch_ops) > 1:
+                    self._handle_put_batch(batch_ops)
+                    for k in range(batch_start, j):
+                        results[k] = None
+                    i = j
+                    continue
+
+            # Default: handle single op
             if isinstance(op, GetOp):
-                results.append(self._handle_get(op))
+                results[i] = self._handle_get(op)
             elif isinstance(op, SearchOp):
-                results.append(self._handle_search(op))
+                results[i] = self._handle_search(op)
             elif isinstance(op, PutOp):
                 self._handle_put(op)
-                results.append(None)
+                results[i] = None
             elif isinstance(op, ListNamespacesOp):
-                results.append(self._handle_list_namespaces(op))
+                results[i] = self._handle_list_namespaces(op)
             else:
                 raise ValueError(f"Unsupported operation: {type(op)}")
+            i += 1
+            
         return results
 
-    async def abatch(self, ops: Iterable[Op]) -> list[Result]:
-        results: list[Result] = []
+    def _handle_put_batch(self, ops: list[PutOp]) -> None:
+        """Process a batch of PutOps to the same namespace using generate_memories."""
+        if not ops:
+            return
+            
+        namespace = ops[0].namespace
+        try:
+            scope, _topic = _parse_namespace(namespace)
+        except ValueError:
+            for op in ops:
+                self._handle_put(op)
+            return
+
+        events = []
         for op in ops:
+            fact = op.value.get("fact", "") if op.value else ""
+            if not fact and op.value:
+                fact = json.dumps(op.value)
+            
+            if fact:
+                events.append({
+                    "content": {
+                        "role": "model", 
+                        "parts": [{"text": f"FACT: {fact}"}]
+                    }
+                })
+
+        if not events:
+            return
+
+        self.generate_memories(scope=scope, events=events)
+
+    async def abatch(self, ops: Iterable[Op]) -> list[Result]:
+        """Async version of batch."""
+        ops_list = list(ops)
+        results: list[Result | None] = [None] * len(ops_list)
+        
+        i = 0
+        while i < len(ops_list):
+            op = ops_list[i]
+            if isinstance(op, PutOp) and op.value is not None and op.key is None:
+                batch_start = i
+                namespace = op.namespace
+                batch_ops = [op]
+                
+                j = i + 1
+                while (
+                    j < len(ops_list) 
+                    and isinstance(ops_list[j], PutOp) 
+                    and ops_list[j].value is not None 
+                    and ops_list[j].key is None
+                    and ops_list[j].namespace == namespace
+                ):
+                    batch_ops.append(ops_list[j])
+                    j += 1
+                
+                if len(batch_ops) > 1:
+                    await self._ahandle_put_batch(batch_ops)
+                    for k in range(batch_start, j):
+                        results[k] = None
+                    i = j
+                    continue
+
             if isinstance(op, GetOp):
-                results.append(await self._ahandle_get(op))
+                results[i] = await self._ahandle_get(op)
             elif isinstance(op, SearchOp):
-                results.append(await self._ahandle_search(op))
+                results[i] = await self._ahandle_search(op)
             elif isinstance(op, PutOp):
                 await self._ahandle_put(op)
-                results.append(None)
+                results[i] = None
             elif isinstance(op, ListNamespacesOp):
-                results.append(await self._ahandle_list_namespaces(op))
+                results[i] = await self._ahandle_list_namespaces(op)
             else:
                 raise ValueError(f"Unsupported operation: {type(op)}")
+            i += 1
+            
         return results
+
+    async def _ahandle_put_batch(self, ops: list[PutOp]) -> None:
+        """Async version of _handle_put_batch."""
+        if not ops:
+            return
+            
+        namespace = ops[0].namespace
+        try:
+            scope, _topic = _parse_namespace(namespace)
+        except ValueError:
+            for op in ops:
+                await self._ahandle_put(op)
+            return
+
+        events = []
+        for op in ops:
+            fact = op.value.get("fact", "") if op.value else ""
+            if not fact and op.value:
+                fact = json.dumps(op.value)
+            if fact:
+                events.append({
+                    "content": {
+                        "role": "model", 
+                        "parts": [{"text": f"FACT: {fact}"}]
+                    }
+                })
+
+        if not events:
+            return
+
+        await self.agenerate_memories(scope=scope, events=events)
 
     # ── Sync handlers ───────────────────────────────────────────────────
 
@@ -559,6 +685,103 @@ class VertexMemoryBankStore(BaseStore):
 
     # ── Utilities ───────────────────────────────────────────────────────
 
+    # ── Memory Revisions (extension, not part of BaseStore) ────────────
+
+    def list_revisions(
+        self,
+        namespace: tuple[str, ...],
+        key: str,
+    ) -> list[Any]:
+        """List revisions for a memory.
+
+        Not part of the ``BaseStore`` interface — this is a Memory Bank–specific extension.
+
+        Args:
+            namespace: The namespace of the memory.
+            key: The key (ID) of the memory.
+
+        Returns:
+            A list of memory revision objects from the SDK.
+        """
+        memory_name = f"{self._engine_name}/memories/{key}"
+        return list(self._memories.revisions.list(name=memory_name))
+
+    def get_revision(
+        self,
+        namespace: tuple[str, ...],
+        key: str,
+        revision_id: str,
+    ) -> Any:
+        """Get a specific memory revision.
+
+        Not part of the ``BaseStore`` interface — this is a Memory Bank–specific extension.
+
+        Args:
+            namespace: The namespace of the memory.
+            key: The key (ID) of the memory.
+            revision_id: The ID of the revision.
+
+        Returns:
+            The memory revision object from the SDK.
+        """
+        memory_name = f"{self._engine_name}/memories/{key}/revisions/{revision_id}"
+        return self._memories.revisions.get(name=memory_name)
+
+    def rollback(
+        self,
+        namespace: tuple[str, ...],
+        key: str,
+        revision_id: str,
+    ) -> Any:
+        """Rollback a memory to a specific revision.
+
+        Not part of the ``BaseStore`` interface — this is a Memory Bank–specific extension.
+
+        Args:
+            namespace: The namespace of the memory.
+            key: The key (ID) of the memory.
+            revision_id: The target revision ID.
+
+        Returns:
+            The operation result from the SDK.
+        """
+        memory_name = f"{self._engine_name}/memories/{key}"
+        return self._memories.rollback(name=memory_name, target_revision_id=revision_id)
+
+    async def alist_revisions(
+        self,
+        namespace: tuple[str, ...],
+        key: str,
+    ) -> list[Any]:
+        """Async version of :meth:`list_revisions`."""
+        memory_name = f"{self._engine_name}/memories/{key}"
+        pager = await self._amemories.revisions.list(name=memory_name)
+        revisions = []
+        async for r in pager:
+            revisions.append(r)
+        return revisions
+
+    async def aget_revision(
+        self,
+        namespace: tuple[str, ...],
+        key: str,
+        revision_id: str,
+    ) -> Any:
+        """Async version of :meth:`get_revision`."""
+        memory_name = f"{self._engine_name}/memories/{key}/revisions/{revision_id}"
+        return await self._amemories.revisions.get(name=memory_name)
+
+    async def arollback(
+        self,
+        namespace: tuple[str, ...],
+        key: str,
+        revision_id: str,
+    ) -> Any:
+        """Async version of :meth:`rollback`."""
+        memory_name = f"{self._engine_name}/memories/{key}"
+        return await self._amemories.rollback(name=memory_name, target_revision_id=revision_id)
+
+
     def _get_ttl(self, namespace: tuple[str, ...], put_ttl: float | None) -> str | None:
         if put_ttl is not None:
             return f"{int(put_ttl)}s"
@@ -588,7 +811,7 @@ class VertexMemoryBankStore(BaseStore):
         """Convert a scope dict to a namespace tuple."""
         return _scope_to_namespace(scope, self.namespace_prefix, topic)
 
-    def generate_memories(
+    def extract_memories_anthropic(
         self,
         conversation: list[dict[str, Any]],
         namespace: tuple[str, ...],
@@ -646,7 +869,7 @@ def create_capture_node(store: VertexMemoryBankStore, namespace: tuple[str, ...]
 
     def capture_node(state: dict) -> dict:
         if "messages" in state:
-            store.generate_memories(state["messages"], namespace)
+            store.extract_memories_anthropic(state["messages"], namespace)
         return {}
 
     return capture_node

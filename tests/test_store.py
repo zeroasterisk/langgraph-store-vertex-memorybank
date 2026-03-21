@@ -8,7 +8,7 @@ from __future__ import annotations
 import json
 from datetime import datetime, timezone
 from typing import Any
-from unittest.mock import MagicMock, patch
+from unittest.mock import MagicMock, patch, AsyncMock
 
 import pytest
 from langgraph.store.base import MatchCondition
@@ -494,7 +494,7 @@ class TestGenerateMemories:
 
         conversation = [{"role": "user", "content": "Hello"}, {"role": "assistant", "content": "Hi"}]
         namespace = ("memories", "user_id", "alice")
-        store.generate_memories(conversation, namespace)
+        store.extract_memories_anthropic(conversation, namespace)
 
         mock_client.messages.create.assert_called_once()
         assert mock_memories.create.call_count == 2
@@ -514,7 +514,7 @@ class TestCreateCaptureNode:
         capture_node = create_capture_node(store, namespace)
         assert callable(capture_node)
 
-        with patch.object(store, "generate_memories") as mock_generate_memories:
+        with patch.object(store, "extract_memories_anthropic") as mock_generate_memories:
             state = {"messages": [{"role": "user", "content": "Hello"}]}
             capture_node(state)
             mock_generate_memories.assert_called_once_with(state["messages"], namespace)
@@ -570,3 +570,56 @@ def test_aput_ttl():
     mock_client.aio.agent_engines.memories.create.assert_called_once()
     kwargs = mock_client.aio.agent_engines.memories.create.call_args.kwargs
     assert kwargs["config"]["ttl"] == "100s"
+
+class TestRevisions:
+    def test_list_revisions(self):
+        mock_memories, store = _make_store()
+        store._client.agent_engines.memories.revisions.list.return_value = ["rev1", "rev2"]
+        revs = store.list_revisions(("memories", "user", "alice"), "my-key")
+        assert revs == ["rev1", "rev2"]
+        store._client.agent_engines.memories.revisions.list.assert_called_once_with(name="projects/test-project/locations/us-central1/reasoningEngines/123456/memories/my-key")
+
+    def test_get_revision(self):
+        mock_memories, store = _make_store()
+        store._client.agent_engines.memories.revisions.get.return_value = "rev1"
+        rev = store.get_revision(("memories", "user", "alice"), "my-key", "my-rev")
+        assert rev == "rev1"
+        store._client.agent_engines.memories.revisions.get.assert_called_once_with(name="projects/test-project/locations/us-central1/reasoningEngines/123456/memories/my-key/revisions/my-rev")
+
+    def test_rollback(self):
+        mock_memories, store = _make_store()
+        store._client.agent_engines.memories.rollback.return_value = "op1"
+        res = store.rollback(("memories", "user", "alice"), "my-key", "my-rev")
+        assert res == "op1"
+        store._client.agent_engines.memories.rollback.assert_called_once_with(name="projects/test-project/locations/us-central1/reasoningEngines/123456/memories/my-key", target_revision_id="my-rev")
+
+    @pytest.mark.asyncio
+    async def test_alist_revisions(self):
+        mock_memories, store = _make_store()
+        async def mock_list(*args, **kwargs):
+            async def pager():
+                yield "rev1"
+                yield "rev2"
+            return pager()
+        store._client.aio.agent_engines.memories.revisions.list = mock_list
+        revs = await store.alist_revisions(("memories", "user", "alice"), "my-key")
+        assert revs == ["rev1", "rev2"]
+
+    @pytest.mark.asyncio
+    async def test_aget_revision(self):
+        mock_memories, store = _make_store()
+        # Mock as async function
+        async def mock_get(name):
+            return "rev1"
+        store._client.aio.agent_engines.memories.revisions.get = mock_get
+        rev = await store.aget_revision(("memories", "user", "alice"), "my-key", "my-rev")
+        assert rev == "rev1"
+
+    @pytest.mark.asyncio
+    async def test_arollback(self):
+        mock_memories, store = _make_store()
+        async def mock_rollback(name, target_revision_id):
+            return "op1"
+        store._client.aio.agent_engines.memories.rollback = mock_rollback
+        res = await store.arollback(("memories", "user", "alice"), "my-key", "my-rev")
+        assert res == "op1"
